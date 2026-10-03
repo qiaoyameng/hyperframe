@@ -17,6 +17,9 @@ you need is not present!
 .. autoclass:: hyperframe.frame.Frame
    :members:
 
+.. autoclass:: hyperframe.frame.FrameSendCursor
+   :members:
+
 .. autoclass:: hyperframe.frame.Padding
    :members:
 

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import binascii
 import struct
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable  # pragma: no cover
+    from collections.abc import Iterable, Sequence  # pragma: no cover
 
 from .exceptions import InvalidDataError, InvalidFrameError, InvalidPaddingError, UnknownFrameError
 from .flags import Flag, Flags
@@ -37,6 +37,10 @@ _STRUCT_LB = struct.Struct(">LB")
 _STRUCT_L = struct.Struct(">L")
 _STRUCT_H = struct.Struct(">H")
 _STRUCT_B = struct.Struct(">B")
+
+ReadableBuffer: TypeAlias = bytes | bytearray | memoryview
+BufferSegment: TypeAlias = memoryview
+_PADDING = b"\x00" * 255
 
 
 class Frame:
@@ -177,6 +181,51 @@ class Frame:
 
         return header + body
 
+    def serialize_segments(self) -> tuple[memoryview, ...]:
+        """
+        Serialize this frame as separate buffers suitable for ``writev``.
+
+        Read-only payload buffers are borrowed instead of being copied into
+        one contiguous byte string. Mutable source objects remain owned by the
+        caller and must not be modified or resized while the returned
+        segments, or a cursor created from them, are still in use. The caller
+        may drop its own reference; the borrowed views keep the object alive.
+        Once all segments and cursors have been consumed or discarded, the
+        caller may mutate the source object normally.
+        """
+        return self._with_header(self.serialize_body_segments())
+
+    def serialize_body_segments(self) -> tuple[ReadableBuffer, ...]:
+        """
+        Return the body as segments without joining the payload.
+        """
+        return (self.serialize_body(),)
+
+    def send_cursor(self) -> FrameSendCursor:
+        """
+        Create an independent cursor over this frame's serialized segments.
+        """
+        return FrameSendCursor(self.serialize_segments())
+
+    def _serialize_flags(self) -> int:
+        flags = 0
+        for flag, flag_bit in self.defined_flags:
+            if flag in self.flags:
+                flags |= flag_bit
+        return flags
+
+    def _with_header(self, body_segments: tuple[ReadableBuffer, ...]) -> tuple[BufferSegment, ...]:
+        body_len = sum(len(segment) for segment in body_segments)
+        self.body_len = body_len
+        header = _STRUCT_HBBBL.pack(
+            (body_len >> 8) & 0xFFFF,
+            body_len & 0xFF,
+            self.type,
+            self._serialize_flags(),
+            self.stream_id & 0x7FFFFFFF,
+        )
+        return (memoryview(header), *(_as_readonly_buffer(segment) for segment in body_segments))
+
     def serialize_body(self) -> bytes:
         raise NotImplementedError
 
@@ -210,6 +259,14 @@ class Padding:
         if "PADDED" in self.flags:  # type: ignore
             return _STRUCT_B.pack(self.pad_length)
         return b""
+
+    def serialize_padding_length_segment(self) -> tuple[memoryview, ...]:
+        if "PADDED" in self.flags:  # type: ignore
+            return (memoryview(_STRUCT_B.pack(self.pad_length)),)
+        return ()
+
+    def padding_segment(self) -> memoryview:
+        return memoryview(_PADDING[:self.pad_length])
 
     def parse_padding_data(self, data: memoryview) -> int:
         if "PADDED" in self.flags:  # type: ignore
@@ -293,7 +350,7 @@ class DataFrame(Padding, Frame):
 
     stream_association = _STREAM_ASSOC_HAS_STREAM
 
-    def __init__(self, stream_id: int, data: bytes = b"", **kwargs: Any) -> None:
+    def __init__(self, stream_id: int, data: ReadableBuffer = b"", **kwargs: Any) -> None:
         super().__init__(stream_id, **kwargs)
 
         #: The data contained on this frame.
@@ -305,6 +362,15 @@ class DataFrame(Padding, Frame):
         if isinstance(self.data, memoryview):
             self.data = self.data.tobytes()
         return b"".join([padding_data, self.data, padding])
+
+    def serialize_body_segments(self) -> tuple[ReadableBuffer, ...]:
+        segments = self.serialize_padding_length_segment()
+        data = _as_readonly_buffer(self.data)
+        if data:
+            segments = (*segments, data)
+        if self.pad_length:
+            segments = (*segments, self.padding_segment())
+        return segments
 
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
@@ -499,7 +565,7 @@ class PushPromiseFrame(Padding, Frame):
 
     stream_association = _STREAM_ASSOC_HAS_STREAM
 
-    def __init__(self, stream_id: int, promised_stream_id: int = 0, data: bytes = b"", **kwargs: Any) -> None:
+    def __init__(self, stream_id: int, promised_stream_id: int = 0, data: ReadableBuffer = b"", **kwargs: Any) -> None:
         super().__init__(stream_id, **kwargs)
 
         #: The stream ID that is promised by this frame.
@@ -517,6 +583,16 @@ class PushPromiseFrame(Padding, Frame):
         padding = b"\0" * self.pad_length
         data = _STRUCT_L.pack(self.promised_stream_id)
         return b"".join([padding_data, data, self.data, padding])
+
+    def serialize_body_segments(self) -> tuple[ReadableBuffer, ...]:
+        segments = self.serialize_padding_length_segment()
+        segments = (*segments, memoryview(_STRUCT_L.pack(self.promised_stream_id)))
+        data = _as_readonly_buffer(self.data)
+        if data:
+            segments = (*segments, data)
+        if self.pad_length:
+            segments = (*segments, self.padding_segment())
+        return segments
 
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
@@ -730,7 +806,7 @@ class HeadersFrame(Padding, Priority, Frame):
 
     stream_association = _STREAM_ASSOC_HAS_STREAM
 
-    def __init__(self, stream_id: int, data: bytes = b"", **kwargs: Any) -> None:
+    def __init__(self, stream_id: int, data: ReadableBuffer = b"", **kwargs: Any) -> None:
         super().__init__(stream_id, **kwargs)
 
         #: The HPACK-encoded header block.
@@ -749,6 +825,17 @@ class HeadersFrame(Padding, Priority, Frame):
             priority_data = b""
 
         return b"".join([padding_data, priority_data, self.data, padding])
+
+    def serialize_body_segments(self) -> tuple[ReadableBuffer, ...]:
+        segments = self.serialize_padding_length_segment()
+        if "PRIORITY" in self.flags:
+            segments = (*segments, memoryview(self.serialize_priority_data()))
+        data = _as_readonly_buffer(self.data)
+        if data:
+            segments = (*segments, data)
+        if self.pad_length:
+            segments = (*segments, self.padding_segment())
+        return segments
 
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
@@ -879,7 +966,7 @@ class ExtensionFrame(Frame):
 
     stream_association = _STREAM_ASSOC_EITHER
 
-    def __init__(self, type: int, stream_id: int, flag_byte: int = 0x0, body: bytes = b"", **kwargs: Any) -> None:  # noqa: A002
+    def __init__(self, type: int, stream_id: int, flag_byte: int = 0x0, body: ReadableBuffer = b"", **kwargs: Any) -> None:  # noqa: A002
         super().__init__(stream_id, **kwargs)
         self.type = type
         self.flag_byte = flag_byte
@@ -899,25 +986,118 @@ class ExtensionFrame(Frame):
         self.body_len = len(data)
 
     def serialize(self) -> bytes:
-        """
-        A broad override of the serialize method that ensures that the data
-        comes back out exactly as it came in. This should not be used in most
-        user code: it exists only as a helper method if frames need to be
-        reconstituted.
-        """
-        # Build the frame header.
-        # First, get the flags.
-        flags = self.flag_byte
+        return b"".join(self.serialize_segments())
 
-        header = _STRUCT_HBBBL.pack(
-            (self.body_len >> 8) & 0xFFFF,  # Length spread over top 24 bits
-            self.body_len & 0xFF,
-            self.type,
-            flags,
-            self.stream_id & 0x7FFFFFFF,  # mask off the reserved bit, RFC 9113, Section 4.1
-        )
+    def serialize_body(self) -> bytes:
+        if isinstance(self.body, bytes):
+            return self.body
+        return bytes(self.body)
 
-        return header + self.body
+    def serialize_body_segments(self) -> tuple[ReadableBuffer, ...]:
+        return (_as_readonly_buffer(self.body),)
+
+    def _serialize_flags(self) -> int:
+        return self.flag_byte
+
+
+def _as_readonly_buffer(data: ReadableBuffer) -> BufferSegment:
+    view = memoryview(data)
+    if view.itemsize != 1 or view.ndim != 1:
+        view = view.cast("B") if view.contiguous else memoryview(view.tobytes())
+    if not view.readonly:
+        view = view.toreadonly()
+    return view
+
+
+class FrameSendCursor:
+    """
+    A cursor that reports and advances through serialized frame segments.
+
+    Each cursor owns its own position. Cursors do not mutate the frame or
+    share consumption state with one another. Segments borrow mutable source
+    buffers, so those buffers must remain unchanged until this cursor is
+    consumed or discarded.
+    """
+
+    def __init__(self, segments: Sequence[ReadableBuffer]) -> None:
+        self._segments = tuple(_as_readonly_buffer(segment) for segment in segments)
+        self._segment_index = 0
+        self._offset = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return sum(len(segment) for segment in self.remaining_segments())
+
+    @property
+    def current_segment(self) -> memoryview | None:
+        self._skip_empty_segments()
+        if self._segment_index == len(self._segments):
+            return None
+        return self._segments[self._segment_index][self._offset:]
+
+    def remaining_segments(self) -> tuple[memoryview, ...]:
+        self._skip_empty_segments()
+        if self._segment_index == len(self._segments):
+            return ()
+        current = self._segments[self._segment_index][self._offset:]
+        return (current, *self._segments[self._segment_index + 1:])
+
+    def __len__(self) -> int:
+        return self.remaining_bytes
+
+    def __bool__(self) -> bool:
+        self._skip_empty_segments()
+        return self._segment_index < len(self._segments)
+
+    def __iter__(self) -> FrameSendCursor:
+        return self
+
+    def __next__(self) -> memoryview:
+        segment = self.current_segment
+        if segment is None:
+            raise StopIteration
+        self.advance(len(segment))
+        return segment
+
+    def advance(self, written: int) -> None:
+        """
+        Record that ``written`` bytes were sent.
+
+        A single advance may consume only part of a segment or span several
+        segments. Negative values and values larger than the remaining length
+        are rejected.
+        """
+        if not isinstance(written, int):
+            msg = "written must be an integer"
+            raise TypeError(msg)
+        if written < 0:
+            msg = "written must not be negative"
+            raise ValueError(msg)
+        if written > self.remaining_bytes:
+            msg = "written must not exceed the number of remaining bytes"
+            raise ValueError(msg)
+
+        while written:
+            self._skip_empty_segments()
+            segment_remaining = len(self._segments[self._segment_index]) - self._offset
+            if written < segment_remaining:
+                self._offset += written
+                written = 0
+            else:
+                written -= segment_remaining
+                self._segment_index += 1
+                self._offset = 0
+
+    def _skip_empty_segments(self) -> None:
+        while (
+            self._segment_index < len(self._segments)
+            and self._offset >= len(self._segments[self._segment_index])
+        ):
+            self._segment_index += 1
+            self._offset = 0
+
+
+SendCursor = FrameSendCursor
 
 
 def _raw_data_repr(data: bytes | None) -> str:

@@ -1,5 +1,5 @@
 from hyperframe.frame import (
-    Frame, Flags, DataFrame, PriorityFrame, RstStreamFrame, SettingsFrame,
+    Frame, FrameSendCursor, Flags, DataFrame, PriorityFrame, RstStreamFrame, SettingsFrame,
     PushPromiseFrame, PingFrame, GoAwayFrame, WindowUpdateFrame, HeadersFrame,
     ContinuationFrame, AltSvcFrame, ExtensionFrame
 )
@@ -995,3 +995,185 @@ class TestExtensionFrame:
     def test_repr(self):
         f = ExtensionFrame(0xFF, 1, 42, b'hello')
         assert repr(f).endswith("type=255, flag_byte=42, body=<hex:68656c6c6f>")
+
+
+def segmented_frame(frame_type):
+    if frame_type is DataFrame:
+        frame = DataFrame(1, b"large data payload")
+        frame.flags.add("END_STREAM")
+        return frame
+
+    if frame_type is HeadersFrame:
+        frame = HeadersFrame(1, b"large header block")
+        frame.flags.add("END_HEADERS")
+        frame.flags.add("PRIORITY")
+        frame.flags.add("PADDED")
+        frame.depends_on = 4
+        frame.stream_weight = 64
+        frame.exclusive = True
+        frame.pad_length = 3
+        return frame
+
+    if frame_type is PushPromiseFrame:
+        frame = PushPromiseFrame(1, 4, b"push promise header block")
+        frame.flags.add("END_HEADERS")
+        frame.flags.add("PADDED")
+        frame.pad_length = 5
+        return frame
+
+    return ExtensionFrame(0x33, 1, 0x2A, b"extension payload")
+
+
+@pytest.mark.parametrize("frame_type", [
+    DataFrame,
+    HeadersFrame,
+    PushPromiseFrame,
+    ExtensionFrame,
+])
+def test_segmented_serialization_matches_serialize(frame_type):
+    frame = segmented_frame(frame_type)
+
+    segments = frame.serialize_segments()
+
+    assert b"".join(segments) == frame.serialize()
+    assert frame.body_len == sum(len(segment) for segment in segments[1:])
+    assert all(isinstance(segment, memoryview) for segment in segments)
+    assert all(segment.readonly for segment in segments)
+
+
+def test_segmented_data_borrows_buffer():
+    payload = memoryview(b"x" * 4096)
+    readonly_frame = DataFrame(1, payload)
+    readonly_segment = readonly_frame.serialize_segments()[1]
+
+    mutable_payload = bytearray(b"abcdef")
+    mutable_segment = DataFrame(1, mutable_payload).serialize_segments()[1]
+
+    assert readonly_segment.obj is payload.obj
+    assert readonly_segment.nbytes == 4096
+    assert mutable_segment.readonly
+    assert mutable_segment.obj is mutable_payload
+
+
+@pytest.mark.parametrize("short_writes", [
+    [1],
+    [1, 2, 3, 4, 5],
+    [8, 1, 7, 13, 2, 20],
+])
+def test_send_cursor_reassembles_frame_after_short_writes(short_writes):
+    frame = segmented_frame(HeadersFrame)
+    expected = frame.serialize()
+    cursor = frame.send_cursor()
+    received = bytearray()
+    write_index = 0
+
+    while cursor.current_segment is not None:
+        amount = short_writes[write_index % len(short_writes)]
+        write_index += 1
+        segment = cursor.current_segment
+        written = min(amount, len(segment))
+        received.extend(segment[:written])
+        cursor.advance(written)
+
+    assert bytes(received) == expected
+    assert cursor.remaining_bytes == 0
+    assert cursor.remaining_segments() == ()
+    assert cursor.current_segment is None
+
+
+def test_send_cursor_advances_one_byte_at_a_time():
+    frame = segmented_frame(PushPromiseFrame)
+    expected = frame.serialize()
+    cursor = frame.send_cursor()
+    received = bytearray()
+
+    while cursor:
+        segment = cursor.current_segment
+        received.extend(segment[:1])
+        cursor.advance(1)
+
+    assert bytes(received) == expected
+
+
+def test_send_cursor_reports_remaining_segment():
+    frame = DataFrame(1, b"abcdef")
+    cursor = frame.send_cursor()
+
+    assert cursor.remaining_bytes == len(frame.serialize())
+    cursor.advance(12)
+
+    remaining = cursor.remaining_segments()
+
+    assert len(remaining) == 1
+    assert bytes(remaining[0]) == b"def"
+    assert bytes(cursor.current_segment) == bytes(remaining[0])
+
+
+def test_send_cursors_have_independent_positions():
+    frame = segmented_frame(DataFrame)
+    first = frame.send_cursor()
+    second = frame.send_cursor()
+
+    assert isinstance(first, FrameSendCursor)
+    assert first is not second
+
+    first.advance(12)
+
+    assert bytes(second.remaining_segments()[0]) == frame.serialize()[:9]
+    assert bytes(first.remaining_segments()[0]) != bytes(second.remaining_segments()[0])
+
+
+def test_send_cursor_rejects_invalid_advances():
+    frame = DataFrame(1, b"abc")
+    cursor = frame.send_cursor()
+
+    with pytest.raises(ValueError, match="negative"):
+        cursor.advance(-1)
+
+    with pytest.raises(ValueError, match="remaining"):
+        cursor.advance(len(frame.serialize()) + 1)
+
+
+def test_send_cursor_rejects_non_integer_advance():
+    cursor = DataFrame(1).send_cursor()
+
+    with pytest.raises(TypeError):
+        cursor.advance(1.0)
+
+
+def test_extension_frame_segmented_flags_and_length():
+    frame = ExtensionFrame(0x33, 1, 0x2A, b"ext")
+
+    serialized = b"".join(frame.serialize_segments())
+
+    assert serialized[:9] == b"\x00\x00\x03\x33\x2a\x00\x00\x00\x01"
+    assert serialized == frame.serialize()
+
+
+@pytest.mark.parametrize("frame", [
+    DataFrame(1, memoryview(b"data block")),
+    HeadersFrame(1, memoryview(b"header block")),
+    PushPromiseFrame(1, 4, memoryview(b"push block")),
+    ExtensionFrame(0x55, 1, 0, memoryview(b"extension body")),
+])
+def test_segmented_payloads_reuse_readonly_buffer(frame):
+    payload = frame.body if isinstance(frame, ExtensionFrame) else frame.data
+
+    payload_segment = next(
+        segment for segment in frame.serialize_segments()
+        if segment.obj is payload.obj
+    )
+
+    assert payload_segment.nbytes == len(payload)
+
+
+def test_segmented_padding_and_priority_count_in_real_length():
+    frame = HeadersFrame(1, b"data")
+    frame.flags.add("PRIORITY")
+    frame.flags.add("PADDED")
+    frame.pad_length = 2
+
+    segments = frame.serialize_segments()
+
+    assert frame.body_len == 1 + 5 + 4 + 2
+    assert [len(segment) for segment in segments] == [9, 1, 5, 4, 2]
