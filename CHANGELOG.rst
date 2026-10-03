@@ -6,6 +6,13 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added ``Frame.serialize_segments()`` and ``Frame.send_cursor()``: frames can
+  now be serialized into a list of read-only buffer segments suitable for
+  vectored (``writev``-style) sends, without copying large payloads into a
+  single contiguous bytestring. ``FrameSendCursor`` tracks partially-written
+  sends across the segments. Segmented serialization is implemented for DATA,
+  HEADERS, PUSH_PROMISE and extension frames; all other frames fall back to a
+  single body segment.
 - Setting Identifier are now correctly serialized as 16-bit values, instead of 8-bit.
 - GoAwayFrame and WindowUpdateFrame now correctly mask off the reserved bit during
   parsing and serialization of stream IDs and window increments, as per RFC 9113,

@@ -6,6 +6,7 @@ from hyperframe.frame import (
 from hyperframe.exceptions import (
     UnknownFrameError, InvalidPaddingError, InvalidFrameError, InvalidDataError
 )
+import itertools
 import pytest
 
 
@@ -995,3 +996,142 @@ class TestExtensionFrame:
     def test_repr(self):
         f = ExtensionFrame(0xFF, 1, 42, b'hello')
         assert repr(f).endswith("type=255, flag_byte=42, body=<hex:68656c6c6f>")
+
+
+def drain_cursor(cursor, chunk_sizes):
+    """
+    Simulate a writer that sends the cursor's remaining segments with a
+    ``writev``-like call that only writes up to ``chunk_size`` bytes at a
+    time, possibly stopping in the middle of a segment.
+    """
+    out = bytearray()
+    sizes = itertools.cycle(chunk_sizes)
+    while not cursor.exhausted:
+        segments = cursor.remaining_segments()
+        assert segments
+        budget = next(sizes)
+        written = 0
+        for segment in segments:
+            if written >= budget:
+                break
+            piece = segment[:budget - written]
+            out += piece
+            written += len(piece)
+        cursor.advance(written)
+    return bytes(out)
+
+
+class TestSegmentedSerialization:
+    def example_frames(self):
+        data = DataFrame(stream_id=1, data=b"hello, world!")
+
+        padded_data = DataFrame(stream_id=1, data=b"padded", pad_length=9)
+        padded_data.flags.add("PADDED")
+
+        headers = HeadersFrame(stream_id=1, data=b"header-block")
+        headers.flags.add("PRIORITY")
+        headers.depends_on = 3
+        headers.stream_weight = 200
+        headers.exclusive = True
+
+        padded_headers = HeadersFrame(stream_id=1, data=b"hb", pad_length=4)
+        padded_headers.flags.add("PADDED")
+        padded_headers.flags.add("PRIORITY")
+
+        push_promise = PushPromiseFrame(
+            stream_id=1, promised_stream_id=2, data=b"promised", pad_length=5,
+        )
+        push_promise.flags.add("PADDED")
+
+        extension, _ = Frame.parse_frame_header(
+            b"\x00\x00\x05\xff\x09\x00\x00\x00\x01"
+        )
+        extension.parse_body(memoryview(b"\x01\x02\x03\x04\x05"))
+
+        return [data, padded_data, headers, padded_headers, push_promise, extension]
+
+    @pytest.mark.parametrize("chunk_sizes", [
+        (1,),            # byte-by-byte
+        (2, 3, 5, 7),    # assorted short writes crossing segment boundaries
+        (9, 1, 1000),    # header-sized, tiny, then oversized
+        (4096,),         # single write larger than the frame
+    ])
+    def test_cursor_reassembly_matches_serialize(self, chunk_sizes):
+        for frame in self.example_frames():
+            expected = frame.serialize()
+            cursor = frame.send_cursor()
+            assert cursor.remaining == len(expected)
+            assert drain_cursor(cursor, chunk_sizes) == expected
+            assert cursor.remaining == 0
+            assert cursor.remaining_segments() == []
+
+    def test_segments_concatenate_to_serialize(self):
+        for frame in self.example_frames():
+            assert b"".join(frame.serialize_segments()) == frame.serialize()
+
+    def test_large_data_payload_is_not_copied(self):
+        payload = bytes(1 << 20)
+        frame = DataFrame(stream_id=1, data=payload)
+        segments = frame.serialize_segments()
+        # The payload segment must be a view over the original buffer.
+        assert any(segment.obj is payload for segment in segments)
+
+    def test_readonly_memoryview_payload_is_not_copied(self):
+        payload = memoryview(b"x" * 100)
+        frame = DataFrame(stream_id=1, data=payload)
+        segments = frame.serialize_segments()
+        assert any(segment is payload for segment in segments)
+        # The frame attribute itself is left untouched.
+        assert frame.data is payload
+
+    def test_mutable_payload_is_snapshotted(self):
+        payload = bytearray(b"mutable data")
+        frame = DataFrame(stream_id=1, data=payload)
+        segments = frame.serialize_segments()
+        payload[:] = b"XXXXXXXXXXXX"
+        assert b"".join(segments) == (
+            b"\x00\x00\x0c\x00\x00\x00\x00\x00\x01" + b"mutable data"
+        )
+
+    def test_cursors_do_not_share_position(self):
+        frame = DataFrame(stream_id=1, data=b"independent")
+        expected = frame.serialize()
+        first = frame.send_cursor()
+        second = frame.send_cursor()
+
+        first.advance(5)
+        assert first.remaining == len(expected) - 5
+        assert second.remaining == len(expected)
+
+        assert drain_cursor(first, (3,)) == expected[5:]
+        assert drain_cursor(second, (4,)) == expected
+
+    def test_partial_segment_consumption_offsets_first_segment(self):
+        frame = DataFrame(stream_id=1, data=b"abcdef")
+        cursor = frame.send_cursor()
+        cursor.advance(11)  # 9-byte header + 2 body bytes
+        segments = cursor.remaining_segments()
+        assert bytes(segments[0]) == b"cdef"
+
+    def test_advance_rejects_negative(self):
+        cursor = DataFrame(stream_id=1, data=b"data").send_cursor()
+        with pytest.raises(ValueError):
+            cursor.advance(-1)
+
+    def test_advance_rejects_overrun(self):
+        frame = DataFrame(stream_id=1, data=b"data")
+        cursor = frame.send_cursor()
+        with pytest.raises(ValueError):
+            cursor.advance(cursor.remaining + 1)
+        cursor.advance(cursor.remaining)
+        with pytest.raises(ValueError):
+            cursor.advance(1)
+
+    def test_lengths_include_header_priority_and_padding(self):
+        frame = HeadersFrame(stream_id=1, data=b"hb", pad_length=4)
+        frame.flags.add("PADDED")
+        frame.flags.add("PRIORITY")
+        cursor = frame.send_cursor()
+        # 9-byte header + 1 pad-length byte + 5 priority bytes + 2 data + 4 pad
+        assert cursor.remaining == 9 + 1 + 5 + 2 + 4
+        assert frame.body_len == 1 + 5 + 2 + 4

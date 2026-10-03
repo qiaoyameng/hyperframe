@@ -39,6 +39,105 @@ _STRUCT_H = struct.Struct(">H")
 _STRUCT_B = struct.Struct(">B")
 
 
+def _readonly_buffer(data: bytes | bytearray | memoryview) -> memoryview:
+    """
+    Return a read-only, contiguous memoryview over ``data``.
+
+    Ownership rules: read-only inputs (``bytes``, read-only ``memoryview``)
+    are reused zero-copy, so the caller must not expect the frame to hold an
+    independent copy. Mutable inputs (``bytearray``, writable ``memoryview``)
+    are snapshotted into an immutable copy at call time, so later mutation of
+    the caller's buffer cannot corrupt a frame that was already serialized
+    into segments.
+    """
+    if isinstance(data, memoryview) and data.readonly and data.contiguous:
+        return data
+    view = memoryview(data)
+    if view.readonly and view.contiguous:
+        return view
+    return memoryview(view.tobytes())
+
+
+class FrameSendCursor:
+    """
+    An advanceable cursor over the serialized segments of a single frame.
+
+    The cursor is aimed at vectored (``writev``-style) sends: it hands out
+    the not-yet-sent segments as read-only memoryviews and accepts the number
+    of bytes actually written, which may stop in the middle of a segment.
+
+    Each cursor owns its consumption position: two cursors created from the
+    same frame advance independently of each other.
+
+    .. versionadded:: 6.2.0
+    """
+
+    def __init__(self, segments: Iterable[memoryview]) -> None:
+        self._segments = [
+            segment if isinstance(segment, memoryview) else memoryview(segment)
+            for segment in segments
+        ]
+        self._index = 0
+        self._offset = 0
+        self._remaining = sum(len(segment) for segment in self._segments)
+
+    @property
+    def remaining(self) -> int:
+        """
+        The total number of bytes not yet consumed, including the frame
+        header, optional priority fields, the padding length byte and any
+        trailing padding.
+        """
+        return self._remaining
+
+    @property
+    def exhausted(self) -> bool:
+        """
+        Whether every byte of the frame has been consumed.
+        """
+        return self._remaining == 0
+
+    def remaining_segments(self) -> list[memoryview]:
+        """
+        The not-yet-consumed segments, suitable for a single ``writev`` call.
+        The first segment is offset past any partially consumed prefix.
+        Empty segments are omitted.
+        """
+        segments = []
+        if self._index < len(self._segments):
+            first = self._segments[self._index][self._offset:]
+            if len(first):
+                segments.append(first)
+            for segment in self._segments[self._index + 1:]:
+                if len(segment):
+                    segments.append(segment)
+        return segments
+
+    def advance(self, written: int) -> None:
+        """
+        Consume ``written`` bytes, matching the number of bytes actually
+        written by the last send. Raises :class:`ValueError` if ``written``
+        is negative or exceeds the number of remaining bytes.
+        """
+        if written < 0:
+            msg = f"Cannot advance by a negative amount: {written}"
+            raise ValueError(msg)
+        if written > self._remaining:
+            msg = f"Cannot advance {written} bytes: only {self._remaining} remaining"
+            raise ValueError(msg)
+
+        self._remaining -= written
+        while written:
+            available = len(self._segments[self._index]) - self._offset
+            if written < available:
+                self._offset += written
+                written = 0
+            else:
+                written -= available
+                self._index += 1
+                self._offset = 0
+
+
 class Frame:
     """
     The base class for all HTTP/2 frames.
@@ -159,23 +258,55 @@ class Frame:
         body = self.serialize_body()
         self.body_len = len(body)
 
-        # Build the common frame header.
-        # First, get the flags.
-        flags = 0
+        return self._serialize_header() + body
 
+    def _flags_byte(self) -> int:
+        flags = 0
         for flag, flag_bit in self.defined_flags:
             if flag in self.flags:
                 flags |= flag_bit
+        return flags
 
-        header = _STRUCT_HBBBL.pack(
+    def _serialize_header(self) -> bytes:
+        return _STRUCT_HBBBL.pack(
             (self.body_len >> 8) & 0xFFFF,  # Length spread over top 24 bits
             self.body_len & 0xFF,
             self.type,
-            flags,
+            self._flags_byte(),
             self.stream_id & 0x7FFFFFFF,  # mask off the reserved bit, RFC 9113, Section 4.1
         )
 
-        return header + body
+    def serialize_body_segments(self) -> list[memoryview]:
+        """
+        The serialized body of the frame as a list of read-only buffer
+        segments. Frames with large payloads override this to avoid copying
+        the payload into a single contiguous bytestring.
+
+        .. versionadded:: 6.2.0
+        """
+        return [_readonly_buffer(self.serialize_body())]
+
+    def serialize_segments(self) -> list[memoryview]:
+        """
+        Convert a frame into a list of read-only buffer segments covering the
+        frame header followed by the body. Concatenating the segments yields
+        exactly the same bytes as :meth:`serialize`, but large payloads are
+        referenced in place instead of being copied.
+
+        .. versionadded:: 6.2.0
+        """
+        body_segments = list(self.serialize_body_segments())
+        self.body_len = sum(len(segment) for segment in body_segments)
+        return [memoryview(self._serialize_header()), *body_segments]
+
+    def send_cursor(self) -> FrameSendCursor:
+        """
+        Return a :class:`FrameSendCursor` over this frame's serialized
+        segments, ready for vectored sends.
+
+        .. versionadded:: 6.2.0
+        """
+        return FrameSendCursor(self.serialize_segments())
 
     def serialize_body(self) -> bytes:
         raise NotImplementedError
@@ -305,6 +436,15 @@ class DataFrame(Padding, Frame):
         if isinstance(self.data, memoryview):
             self.data = self.data.tobytes()
         return b"".join([padding_data, self.data, padding])
+
+    def serialize_body_segments(self) -> list[memoryview]:
+        segments = []
+        if "PADDED" in self.flags:
+            segments.append(memoryview(_STRUCT_B.pack(self.pad_length)))
+        segments.append(_readonly_buffer(self.data))
+        if self.pad_length:
+            segments.append(memoryview(b"\0" * self.pad_length))
+        return segments
 
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
@@ -517,6 +657,16 @@ class PushPromiseFrame(Padding, Frame):
         padding = b"\0" * self.pad_length
         data = _STRUCT_L.pack(self.promised_stream_id)
         return b"".join([padding_data, data, self.data, padding])
+
+    def serialize_body_segments(self) -> list[memoryview]:
+        segments = []
+        if "PADDED" in self.flags:
+            segments.append(memoryview(_STRUCT_B.pack(self.pad_length)))
+        segments.append(memoryview(_STRUCT_L.pack(self.promised_stream_id)))
+        segments.append(_readonly_buffer(self.data))
+        if self.pad_length:
+            segments.append(memoryview(b"\0" * self.pad_length))
+        return segments
 
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
@@ -750,6 +900,17 @@ class HeadersFrame(Padding, Priority, Frame):
 
         return b"".join([padding_data, priority_data, self.data, padding])
 
+    def serialize_body_segments(self) -> list[memoryview]:
+        segments = []
+        if "PADDED" in self.flags:
+            segments.append(memoryview(_STRUCT_B.pack(self.pad_length)))
+        if "PRIORITY" in self.flags:
+            segments.append(memoryview(self.serialize_priority_data()))
+        segments.append(_readonly_buffer(self.data))
+        if self.pad_length:
+            segments.append(memoryview(b"\0" * self.pad_length))
+        return segments
+
     def parse_body(self, data: memoryview) -> None:
         padding_data_length = self.parse_padding_data(data)
         data = data[padding_data_length:]
@@ -898,26 +1059,12 @@ class ExtensionFrame(Frame):
         self.body = data.tobytes()
         self.body_len = len(data)
 
-    def serialize(self) -> bytes:
-        """
-        A broad override of the serialize method that ensures that the data
-        comes back out exactly as it came in. This should not be used in most
-        user code: it exists only as a helper method if frames need to be
-        reconstituted.
-        """
-        # Build the frame header.
-        # First, get the flags.
-        flags = self.flag_byte
+    def _flags_byte(self) -> int:
+        # Extension frames preserve the raw flag byte instead of named flags.
+        return self.flag_byte
 
-        header = _STRUCT_HBBBL.pack(
-            (self.body_len >> 8) & 0xFFFF,  # Length spread over top 24 bits
-            self.body_len & 0xFF,
-            self.type,
-            flags,
-            self.stream_id & 0x7FFFFFFF,  # mask off the reserved bit, RFC 9113, Section 4.1
-        )
-
-        return header + self.body
+    def serialize_body(self) -> bytes:
+        return self.body
 
 
 def _raw_data_repr(data: bytes | None) -> str:
