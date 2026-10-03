@@ -11,6 +11,10 @@ dev
   parsing and serialization of stream IDs and window increments, as per RFC 9113,
   Sections 6.8 and 6.9.
 - Support for Python 3.14 has been added.
+- Added ``hyperframe.envelope.FrameEnvelope``, a wire-format-preserving wrapper
+  that pairs a parsed frame with its original header and payload bytes, so
+  analysis tooling can forward frames byte-for-byte while still applying
+  explicit edits to the stream ID or known flags.
 
 **API Changes (Backward Incompatible)**
 

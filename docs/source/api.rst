@@ -69,6 +69,12 @@ you need is not present!
 
 .. autodata:: hyperframe.frame.FRAMES
 
+Wire-Preserving Envelopes
+-------------------------
+
+.. autoclass:: hyperframe.envelope.FrameEnvelope
+   :members:
+
 Exceptions
 ----------
 
